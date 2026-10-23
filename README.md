@@ -6,7 +6,6 @@ Borzoi Academic Hub is a personal attendance dashboard for college students. It 
 
 > Built for the AWS Strands Decider 2B hackathon.
 
-<!-- Add a screenshot or a 30-60 second demo GIF here. -->
 
 ---
 
@@ -167,6 +166,4 @@ Open the address Vite prints, usually `http://localhost:5173`.
 - Only Discord has been tested as a chat source.
 - Informal chat is hard to classify perfectly, which is why detected announcements need confirmation.
 
-## License
 
-Add a license file (MIT is a common default) before sharing widely.
