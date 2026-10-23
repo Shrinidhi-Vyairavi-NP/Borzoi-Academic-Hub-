@@ -31,7 +31,7 @@ This project demonstrates the **#policy** decision pattern using AWS Strands Dec
 ### 1. Prerequisites & Environment Setup
 Clone the repository and create a Python virtual environment:
 ```bash
-git clone [https://github.com/YOUR_GITHUB_USERNAME/borzoi-academic-hub.git](https://github.com/YOUR_GITHUB_USERNAME/borzoi-academic-hub.git)
+git clone [https://github.com/Shrinidhi-Vyairavi-NP/Borzoi-Academic-Hub.git](https://github.com/Shrinidhi-Vyairavi-NP/Borzoi-Academic-Hub.git)
 cd borzoi-academic-hub
 
 # Set up Python virtual environment
