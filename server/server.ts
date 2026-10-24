@@ -1,176 +1,162 @@
 import express from 'express';
-import { GoogleGenAI, Type } from '@google/genai';
-import path from 'path';
-import { fileURLToPath } from 'url';
-import dotenv from 'dotenv';
-import { classifyWithStrandsDecider } from './services/deciderClient.js';
-
-dotenv.config();
-
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+import cors from 'cors';
+import { BedrockRuntimeClient, InvokeModelCommand } from '@aws-sdk/client-bedrock-runtime';
 
 const app = express();
-const port = process.env.PORT || 3000;
 
-app.use(express.json({ limit: '10mb' }));
+// Explicit CORS Configuration for Frontend Integration & External Webhooks
+app.use(
+  cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
 
-const apiKey = process.env.GEMINI_API_KEY || '';
-let ai: GoogleGenAI | null = null;
+app.use(express.json());
 
-if (apiKey) {
-  ai = new GoogleGenAI({ apiKey });
-}
+// Initialize AWS Bedrock Client
+const bedrockClient = new BedrockRuntimeClient({
+  region: process.env.AWS_REGION || 'us-east-1',
+});
 
-const botBroadcastQueue: Array<any> = [];
+// In-memory store for incoming webhooks
+let liveMessages: any[] = [];
 
-// 1. Webhook endpoint for Discord Bot
-app.post('/api/discord-webhook', (req, res) => {
+// Helper function to invoke Amazon Bedrock (System 2 Pairing)
+async function invokeBedrock(prompt: string): Promise<string> {
   try {
-    const { author, channel, content, guildName } = req.body;
-    if (!content) return res.status(400).json({ error: 'Content required' });
-
     const payload = {
-      id: `discord-${Date.now()}`,
-      platform: 'discord',
-      sender: author || 'Discord User',
-      senderRole: 'Class Representative',
-      channelName: `#${channel || 'announcements'} (${guildName || 'Campus Server'})`,
-      message: content,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      anthropic_version: 'bedrock-2023-05-31',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }],
     };
 
-    botBroadcastQueue.push(payload);
-    if (botBroadcastQueue.length > 50) botBroadcastQueue.shift();
+    const command = new InvokeModelCommand({
+      // Active AWS Bedrock Cross-Region Inference ID for Claude 3 Haiku
+      modelId: 'us.anthropic.claude-3-haiku-20240307-v1:0',
+      contentType: 'application/json',
+      accept: 'application/json',
+      body: JSON.stringify(payload),
+    });
 
-    return res.json({ success: true, queuedItems: botBroadcastQueue.length });
+    const response = await bedrockClient.send(command);
+    const responseBody = JSON.parse(new TextDecoder().decode(response.body));
+    return responseBody.content[0].text;
   } catch (error: any) {
-    return res.status(500).json({ error: error.message || 'Webhook failed' });
+    console.log(`[Bedrock Pipeline]: Using local fallback generator (${error.name || 'Offline Mode'})`);
+    return '';
   }
+}
+
+// 1. Discord / Telegram / Custom Webhook Receiver
+app.post('/api/discord-webhook', async (req, res) => {
+  const { author, channel, content, guildName } = req.body;
+  const rawText = (content || '').toLowerCase();
+
+  let policyTag = 'GENERAL_BANTER';
+
+  // Call System 1 Strands Decider 2B Microservice
+  try {
+    const deciderRes = await fetch('http://localhost:8000/classify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: content || '' }),
+    });
+
+    if (deciderRes.ok) {
+      const deciderData = await deciderRes.json();
+      policyTag = deciderData.decision || 'GENERAL_BANTER';
+      console.log('Strands Decider 2B Decision:', deciderData);
+    } else {
+      throw new Error('Decider service returned non-200 response');
+    }
+  } catch (err) {
+    console.log('[Decider Pipeline]: Python service offline or unreachable, applying local fallback rules.');
+    if (['cancel', 'cancelled', 'canceled', 'postponed', 'no class', 'suspended', 'off today', 'off tomorrow'].some((k) => rawText.includes(k))) {
+      policyTag = 'CLASS_CANCELLED';
+    } else if (['extra', 'rescheduled', 'special class', 'compensation', 'additional class'].some((k) => rawText.includes(k))) {
+      policyTag = 'EXTRA_CLASS';
+    }
+  }
+
+  const newMessage = {
+    id: `msg-${Date.now()}`,
+    platform: 'discord',
+    sender: author || 'Student',
+    senderRole: 'Student',
+    channelName: channel ? `#${channel} (${guildName || 'Server'})` : '#announcements',
+    message: content || '',
+    policy: policyTag,
+    timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+  };
+
+  liveMessages.unshift(newMessage); // Unshift puts newest messages on top
+  res.json({ success: true, queuedItems: liveMessages.length });
 });
 
-// 2. Poll Ingested Live Feeds
-app.get('/api/live-bot-feed', (_req, res) => {
-  return res.json({ messages: botBroadcastQueue });
+// 2. Live Bot Feed Endpoint
+app.get('/api/live-bot-feed', (req, res) => {
+  res.json({ messages: liveMessages });
 });
 
-// 3. Borzoi Meme Bunk Counselor Endpoint
+// 3. AI Bunk Roast (Amazon Bedrock System 2 Pairing)
 app.post('/api/borzoi-roast', async (req, res) => {
-  try {
-    const { subjectName, attended, total, minCriteria, canBunk, margin, consecutiveNeeded } = req.body;
-    const currentPct = total > 0 ? ((attended / total) * 100).toFixed(1) : '100.0';
+  const { subjectName, attended, total, minCriteria, canBunk, margin, consecutiveNeeded } = req.body;
 
-    if (!ai) {
-      if (canBunk) {
-        return res.json({
-          roast: `Lord Foog extends his long snoot: You have ${margin} buffer class(es) to spare in ${subjectName}! Didn't I do it for you? Go get rest, but don't overdo it!`,
-          statusBadge: 'SNOOT APPROVED: SAFE TO SLEEP IN',
-          cookedLevel: 'Crisp & Untouched (Safe)',
-        });
-      } else {
-        return res.json({
-          roast: `BRO YOU ARE DEEP FRIED IN ${subjectName.toUpperCase()}! Your current attendance is ${currentPct}% against ${minCriteria}%. You need ${consecutiveNeeded} consecutive classes right now. SPRINT TO THE LECTURE HALL!`,
-          statusBadge: 'RED ALERT: DEEPLY COOKED',
-          cookedLevel: 'Critically Cooked',
-        });
-      }
-    }
+  const prompt = `You are Lord Foog, the Borzoi Mascot for academic counseling. 
+Subject: ${subjectName}. Attendance: ${attended}/${total} (${Math.round((attended / total) * 100)}%). Target Threshold: ${minCriteria}%.
+Status: ${canBunk ? `Safe to bunk ${margin} classes` : `Cooked. Needs ${consecutiveNeeded} consecutive classes`}.
+Write a humorous, 2-sentence mascot verdict using "Lord Foog" tone and "Didn't I do it for you" vibes.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: `You are Borzoi, the iconic long-snout dog mascot whose motto is "To cook or be cooked • Let me do it for you". 
-Subject: ${subjectName}
-Attended: ${attended}/${total} (${currentPct}%)
-Required Minimum: ${minCriteria}%
-Can Bunk Right Now?: ${canBunk ? 'YES' : 'NO'}
-Buffer margin: ${margin}
-Consecutive needed: ${consecutiveNeeded}
+  const bedrockResponse = await invokeBedrock(prompt);
 
-Instructions: Speak as the Borzoi dog. Use funny, relatable student meme terms ("Didn't I do it for you?", "cooked vs cooking", "HOD speedrun"). Keep it to 3 sentences.`,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            roast: { type: Type.STRING },
-            statusBadge: { type: Type.STRING },
-            cookedLevel: { type: Type.STRING },
-          },
-          required: ['roast', 'statusBadge', 'cookedLevel'],
-        },
-      },
+  if (bedrockResponse) {
+    res.json({
+      roast: bedrockResponse,
+      statusBadge: canBunk ? 'SNOOT APPROVED: SAFE TO BUNK' : 'RED ALERT: DEEPLY COOKED',
+      cookedLevel: canBunk ? 'Crisp & Untouched (Safe)' : 'Critically Overcooked',
     });
-
-    return res.json(JSON.parse(response.text || '{}'));
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message || 'Roast error' });
+  } else {
+    // Local fallback if AWS credentials aren't loaded locally during testing
+    res.json({
+      roast: canBunk
+        ? `Lord Foog extends his snoot over ${subjectName}! You have ${margin} buffer class(es). Didn't I do it for you? Go get rest!`
+        : `BRO YOU ARE DEEP FRIED IN ${subjectName.toUpperCase()}! Current attendance is below ${minCriteria}%. You need ${consecutiveNeeded} consecutive classes RIGHT NOW!`,
+      statusBadge: canBunk ? 'SNOOT APPROVED: SAFE TO BUNK' : 'RED ALERT: DEEPLY COOKED',
+      cookedLevel: canBunk ? 'Crisp & Untouched (Safe)' : 'Critically Overcooked',
+    });
   }
 });
 
-// 4. Official Leave / OD Draft Generator
+// 4. AI Leave Letter Generation (Amazon Bedrock System 2 Pairing)
 app.post('/api/generate-leave-letter', async (req, res) => {
-  try {
-    const { studentName, regNo, degree, semester, reason, leaveType, dates, facultyRecipient, proofDocName } = req.body;
+  const { studentName, regNo, degree, collegeName, semester, reason, leaveType, dates, facultyRecipient } = req.body;
 
-    if (!ai) {
-      const letter = `To,\nThe ${facultyRecipient || 'Head of Department'},\n${degree || 'Department of Engineering'}\n\nRespected Sir/Madam,\n\nSubject: Request for ${leaveType === 'od' ? 'On-Duty (OD) Sanction' : 'Leave of Absence'} - ${studentName || 'Student'} (${regNo || 'N/A'})\n\nI request ${leaveType === 'od' ? 'On-Duty sanction' : 'leave of absence'} for ${dates} due to ${reason}.\n\n${proofDocName ? `Attached Proof: ${proofDocName}\n\n` : ''}Thanking you,\n\nYours sincerely,\n${studentName || 'Student'}\nRoll No: ${regNo || 'N/A'}`;
-      return res.json({ letter, success: true });
-    }
+  const prompt = `Write a formal academic application letter.
+Recipient: ${facultyRecipient}, Department of ${degree}, ${collegeName}.
+Student: ${studentName} (Reg No: ${regNo}, ${degree}, Semester ${semester}).
+Type: ${leaveType === 'od' ? 'On-Duty (OD) Sanction' : 'Leave of Absence'}.
+Dates: ${dates}.
+Reason: ${reason}.
+Return ONLY the formal letter text.`;
 
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: `Draft a formal academic ${leaveType === 'od' ? 'On-Duty (OD)' : 'Leave of Absence'} application email and official letter for ${studentName} (${regNo}), ${degree}, Sem ${semester}. Recipient: ${facultyRecipient}. Reason: ${reason}. Dates: ${dates}. Document attached: ${proofDocName || 'None'}.`,
+  const bedrockResponse = await invokeBedrock(prompt);
+
+  if (bedrockResponse) {
+    res.json({ letter: bedrockResponse });
+  } else {
+    res.json({
+      letter: `To,\nThe ${facultyRecipient},\nDepartment of ${degree},\n${collegeName}.\n\nRespected Sir/Madam,\n\nSubject: Request for ${
+        leaveType === 'od' ? 'On-Duty (OD) Sanction' : 'Leave of Absence'
+      } - ${studentName} (${regNo})\n\nI am writing to request ${
+        leaveType === 'od' ? 'On-Duty sanction' : 'a leave of absence'
+      } for the duration of ${dates} due to ${reason}.\n\nKindly grant permission for the aforementioned period so my academic attendance record remains updated.\n\nThanking you.\n\nYours sincerely,\n${studentName}\nRegister No: ${regNo}\nBranch: ${degree} (Semester ${semester})`,
     });
-
-    return res.json({ letter: response.text, success: true });
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message || 'Leave generation error' });
   }
 });
 
-// 5. Chat & Announcement Parser (Hybrid System-1 Decider + System-2 Gemini)
-app.post('/api/analyze-chat-message', async (req, res) => {
-  try {
-    const { messageText, sender, channelName } = req.body;
-    if (!messageText) return res.status(400).json({ error: 'Message text required' });
-
-    const deciderResult = await classifyWithStrandsDecider(messageText);
-
-    if (!ai) {
-      return res.json({
-        eventType: deciderResult.eventType !== 'UNKNOWN' ? deciderResult.eventType : 'CLASS_CANCELLED',
-        confidence: deciderResult.confidence || 85,
-        summary: 'Schedule update detected in chat channel.',
-        suggestedAction: 'Update timetable schedule',
-        reasoning: 'Evaluated locally by Strands Decider 2B.',
-      });
-    }
-
-    const response = await ai.models.generateContent({
-      model: 'gemini-2.5-flash',
-      contents: `Analyze class message from ${sender} in ${channelName}: "${messageText}". Pre-classified type: ${deciderResult.eventType}`,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            eventType: { type: Type.STRING },
-            confidence: { type: Type.NUMBER },
-            summary: { type: Type.STRING },
-            suggestedAction: { type: Type.STRING },
-            reasoning: { type: Type.STRING },
-          },
-          required: ['eventType', 'confidence', 'summary', 'suggestedAction', 'reasoning'],
-        },
-      },
-    });
-
-    return res.json(JSON.parse(response.text || '{}'));
-  } catch (error: any) {
-    return res.status(500).json({ error: error.message || 'Analysis failed' });
-  }
-});
-
-app.listen(port, () => {
-  console.log(`Borzoi Express Server running on http://localhost:${port}`);
+const PORT = 3000;
+app.listen(PORT, () => {
+  console.log(`Express server running on http://localhost:${PORT}`);
 });
